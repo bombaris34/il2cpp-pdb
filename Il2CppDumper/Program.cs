@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
@@ -97,6 +98,10 @@ namespace Il2CppDumper
                     if (Init(il2cppPath, metadataPath, out var metadata, out var il2Cpp))
                     {
                         Dump(metadata, il2Cpp, outputDir);
+                        if (config.GeneratePdb && config.GenerateStruct && il2Cpp is PE && !il2Cpp.Is32Bit)
+                        {
+                            GeneratePdb(il2cppPath, outputDir);
+                        }
                     }
                 }
                 catch (Exception e)
@@ -249,6 +254,68 @@ namespace Il2CppDumper
                 return false;
             }
             return true;
+        }
+
+        private static void GeneratePdb(string il2cppPath, string outputDir)
+        {
+            try
+            {
+                var tool = FindPdbGen();
+                if (tool == null)
+                {
+                    Console.WriteLine("PDB: il2cpp_pdbgen not found. Run setup.ps1 to build it (skipping PDB generation).");
+                    return;
+                }
+                var header = Path.Combine(outputDir, "il2cpp.h");
+                var script = Path.Combine(outputDir, "script.json");
+                if (!File.Exists(header) || !File.Exists(script))
+                {
+                    Console.WriteLine("PDB: il2cpp.h / script.json not found (skipping).");
+                    return;
+                }
+                var fullDll = Path.GetFullPath(il2cppPath);
+                var pdbOut = Path.Combine(Path.GetDirectoryName(fullDll), Path.GetFileNameWithoutExtension(fullDll) + ".pdb");
+                Console.WriteLine("Generating PDB...");
+                var psi = new ProcessStartInfo { FileName = tool, UseShellExecute = false };
+                psi.ArgumentList.Add(fullDll);
+                psi.ArgumentList.Add(header);
+                psi.ArgumentList.Add(script);
+                psi.ArgumentList.Add(pdbOut);
+                var proc = Process.Start(psi);
+                proc.WaitForExit();
+                if (proc.ExitCode == 0)
+                    Console.WriteLine($"PDB written to {pdbOut}");
+                else
+                    Console.WriteLine($"PDB: generator exited with code {proc.ExitCode}");
+            }
+            catch (Exception e)
+            {
+                Console.WriteLine("PDB: generation failed: " + e.Message);
+            }
+        }
+
+        private static string FindPdbGen()
+        {
+            var env = Environment.GetEnvironmentVariable("IL2CPP_PDBGEN");
+            if (!string.IsNullOrEmpty(env) && File.Exists(env))
+                return env;
+            var baseDir = AppDomain.CurrentDomain.BaseDirectory;
+            foreach (var n in new[] { "il2cpp_pdbgen.exe", "il2cpp_pdbgen" })
+            {
+                var p = Path.Combine(baseDir, n);
+                if (File.Exists(p))
+                    return p;
+            }
+            // Repo layout fallback: <repo>/il2cpp_pdbgen/target/release/il2cpp_pdbgen.exe
+            try
+            {
+                var rel = Path.GetFullPath(Path.Combine(baseDir, "..", "..", "..", "..",
+                    "il2cpp_pdbgen", "target", "release", "il2cpp_pdbgen.exe"));
+                if (File.Exists(rel))
+                    return rel;
+            }
+            catch { }
+            return null;
         }
 
         private static void Dump(Metadata metadata, Il2Cpp il2Cpp, string outputDir)

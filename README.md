@@ -15,6 +15,45 @@ Unity il2cpp reverse engineer
 * Supports generate structures header file
 * Supports Android memory dumped `libil2cpp.so` file to bypass protection
 * Support bypassing simple PE protection
+* **Native PDB generation for x64 PE (`GameAssembly.dll`)** — see below
+
+## Native PDB generation (this fork)
+
+This fork adds [`il2cpp_pdbgen`](il2cpp_pdbgen/), a standalone Rust tool that turns
+Il2CppDumper's output into a real Windows **PDB** that IDA (and other PDB consumers)
+load instantly — replacing the slow in-IDA `ida_with_struct.py` script.
+
+The generated `GameAssembly.pdb` contains:
+
+* **Function names + boundaries** for every method (publics + globals)
+* **Full struct/union types** from `il2cpp.h` with correct x64 layouts
+* **Typed function prototypes** (each function wired to its signature)
+* A GUID/age matching the binary's debug directory, so IDA **auto-loads** it
+
+It is written from scratch (MSF container, TPI/DBI/GSI/PSI streams, a C struct
+layout engine) — no compiler or linker required. Generation takes seconds.
+
+### Setup
+
+```powershell
+# Build the tool and place it next to Il2CppDumper's output.
+# Add -InstallRust to install Rust automatically if you don't have it.
+.\setup.ps1            # or:  .\setup.ps1 -InstallRust
+```
+
+Once built, Il2CppDumper **automatically** generates `<binary>.pdb` next to the
+selected binary whenever the target is an **x64 PE** (set `"GeneratePdb": false`
+in `config.json` to disable). The selected `GameAssembly.dll` path is forwarded
+directly to the generator.
+
+You can also run it manually:
+
+```
+il2cpp_pdbgen <dir>                                   # dir with GameAssembly.dll, il2cpp.h, script.json
+il2cpp_pdbgen <dll> <il2cpp.h> <script.json> [out.pdb]
+```
+
+Then open the binary in IDA — the `.pdb` beside it is picked up automatically.
 
 ## Usage
 
