@@ -95,12 +95,12 @@ namespace Il2CppDumper
             {
                 try
                 {
-                    if (Init(il2cppPath, metadataPath, out var metadata, out var il2Cpp))
+                    if (Init(il2cppPath, metadataPath, out var metadata, out var il2Cpp, out var machoSlice))
                     {
                         Dump(metadata, il2Cpp, outputDir);
-                        if (config.GeneratePdb && config.GenerateStruct && il2Cpp is PE && !il2Cpp.Is32Bit)
+                        if (config.GeneratePdb && config.GenerateStruct && (il2Cpp is PE || il2Cpp is Macho64) && !il2Cpp.Is32Bit)
                         {
-                            GeneratePdb(il2cppPath, outputDir);
+                            GeneratePdb(il2cppPath, outputDir, il2Cpp is Macho64, machoSlice);
                         }
                     }
                 }
@@ -121,8 +121,9 @@ namespace Il2CppDumper
             Console.WriteLine($"usage: {AppDomain.CurrentDomain.FriendlyName} <executable-file> <global-metadata> <output-directory>");
         }
 
-        private static bool Init(string il2cppPath, string metadataPath, out Metadata metadata, out Il2Cpp il2Cpp)
+        private static bool Init(string il2cppPath, string metadataPath, out Metadata metadata, out Il2Cpp il2Cpp, out int? machoSlice)
         {
+            machoSlice = null;
             Console.WriteLine("Initializing metadata...");
             var metadataBytes = File.ReadAllBytes(metadataPath);
             metadata = new Metadata(new MemoryStream(metadataBytes));
@@ -169,8 +170,9 @@ namespace Il2CppDumper
                     Console.WriteLine();
                     var key = Console.ReadKey(true);
                     var index = int.Parse(key.KeyChar.ToString()) - 1;
-                    var magic = machofat.fats[index % 2].magic;
-                    il2cppBytes = machofat.GetMacho(index % 2);
+                    machoSlice = index;
+                    var magic = machofat.fats[index].magic;
+                    il2cppBytes = machofat.GetMacho(index);
                     il2CppMemory = new MemoryStream(il2cppBytes);
                     if (magic == 0xFEEDFACF)
                         goto case 0xFEEDFACF;
@@ -256,7 +258,7 @@ namespace Il2CppDumper
             return true;
         }
 
-        private static void GeneratePdb(string il2cppPath, string outputDir)
+        private static void GeneratePdb(string il2cppPath, string outputDir, bool isMacho, int? machoSlice)
         {
             try
             {
@@ -274,19 +276,27 @@ namespace Il2CppDumper
                     return;
                 }
                 var fullDll = Path.GetFullPath(il2cppPath);
-                var pdbOut = Path.Combine(Path.GetDirectoryName(fullDll), Path.GetFileNameWithoutExtension(fullDll) + ".pdb");
-                Console.WriteLine("Generating PDB...");
+                var pdbOut = isMacho
+                    ? fullDll + ".dSYM"
+                    : Path.Combine(Path.GetDirectoryName(fullDll), Path.GetFileNameWithoutExtension(fullDll) + ".pdb");
+                var format = isMacho ? "dSYM" : "PDB";
+                Console.WriteLine($"Generating {format}...");
                 var psi = new ProcessStartInfo { FileName = tool, UseShellExecute = false };
                 psi.ArgumentList.Add(fullDll);
                 psi.ArgumentList.Add(header);
                 psi.ArgumentList.Add(script);
                 psi.ArgumentList.Add(pdbOut);
+                if (machoSlice.HasValue)
+                {
+                    psi.ArgumentList.Add("--slice");
+                    psi.ArgumentList.Add(machoSlice.Value.ToString());
+                }
                 var proc = Process.Start(psi);
                 proc.WaitForExit();
                 if (proc.ExitCode == 0)
-                    Console.WriteLine($"PDB written to {pdbOut}");
+                    Console.WriteLine($"{format} written to {pdbOut}");
                 else
-                    Console.WriteLine($"PDB: generator exited with code {proc.ExitCode}");
+                    Console.WriteLine($"{format}: generator exited with code {proc.ExitCode}");
             }
             catch (Exception e)
             {

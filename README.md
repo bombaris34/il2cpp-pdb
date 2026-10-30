@@ -15,13 +15,13 @@ Unity il2cpp reverse engineer
 * Supports generate structures header file
 * Supports Android memory dumped `libil2cpp.so` file to bypass protection
 * Support bypassing simple PE protection
-* **Native PDB generation for x64 PE (`GameAssembly.dll`)** — see below
+* **Native debug symbols for x64 PE (PDB) and 64-bit Mach-O (dSYM)** — see below
 
-## Native PDB generation (this fork)
+## Native debug symbol generation (this fork)
 
-This fork adds [`il2cpp_pdbgen`](il2cpp_pdbgen/), a standalone Rust tool that turns
-Il2CppDumper's output into a real Windows **PDB** that IDA (and other PDB consumers)
-load instantly — replacing the slow in-IDA `ida_with_struct.py` script.
+[`il2cpp_pdbgen`](il2cpp_pdbgen/) is a standalone Rust tool that converts
+Il2CppDumper's `il2cpp.h` and `script.json` into a Windows PDB or Mach-O
+DWARF dSYM. It does not require a compiler or linker to generate symbols.
 
 The generated `GameAssembly.pdb` contains:
 
@@ -30,8 +30,17 @@ The generated `GameAssembly.pdb` contains:
 * **Typed function prototypes** (each function wired to its signature)
 * A GUID/age matching the binary's debug directory, so IDA **auto-loads** it
 
-It is written from scratch (MSF container, TPI/DBI/GSI/PSI streams, a C struct
-layout engine) — no compiler or linker required. Generation takes seconds.
+For 64-bit Mach-O (x86-64 and ARM64), the generator emits a UUID-matched dSYM
+with function ranges, struct and union layouts, and prototypes reconstructed
+from the same input. It does not generate source code or line information.
+Types and function boundaries are inferred from the dumper's output.
+Nested anonymous structs and unions retain their layout, and function-pointer
+fields retain their return types, parameters, and supported `const` / `volatile`
+qualifiers. Other declarations are still reconstructed from the generated
+header rather than original compiler debug information.
+In a Linux LLDB smoke test, name-based breakpoints resolved but address lookup
+displayed the original unnamed Mach-O symbol instead of the DWARF name;
+`llvm-symbolizer` resolved the generated name. Consumer behavior may differ.
 
 ### Setup
 
@@ -41,17 +50,27 @@ layout engine) — no compiler or linker required. Generation takes seconds.
 .\setup.ps1            # or:  .\setup.ps1 -InstallRust
 ```
 
-Once built, Il2CppDumper **automatically** generates `<binary>.pdb` next to the
-selected binary whenever the target is an **x64 PE** (set `"GeneratePdb": false`
-in `config.json` to disable). The selected `GameAssembly.dll` path is forwarded
-directly to the generator.
+On Linux or macOS, run `cargo build --release --manifest-path il2cpp_pdbgen/Cargo.toml`
+and copy `il2cpp_pdbgen/target/release/il2cpp_pdbgen` next to the built
+Il2CppDumper executable, or set `IL2CPP_PDBGEN` to its absolute path.
+
+Once built, Il2CppDumper automatically generates a `.pdb` for x64 PE or a
+`<binary>.dSYM` bundle for 64-bit Mach-O next to the selected binary. Set
+`"GeneratePdb": false` in `config.json` to disable both. For a universal
+Mach-O, the dSYM corresponds to the architecture selected in the dumper.
+The generator refuses to overwrite an existing dSYM bundle.
 
 You can also run it manually:
 
 ```
 il2cpp_pdbgen <dir>                                   # dir with GameAssembly.dll, il2cpp.h, script.json
-il2cpp_pdbgen <dll> <il2cpp.h> <script.json> [out.pdb]
+il2cpp_pdbgen <binary> <il2cpp.h> <script.json> [output] [--slice <index>]
 ```
+
+For a universal Mach-O, `--slice` is the zero-based architecture index and
+must match the slice used to produce `script.json` and `il2cpp.h`. The default
+Mach-O output is `<binary>.dSYM`; an explicit output is a new bundle directory.
+For example, pass `--slice 0` for the first architecture.
 
 Then open the binary in IDA — the `.pdb` beside it is picked up automatically.
 

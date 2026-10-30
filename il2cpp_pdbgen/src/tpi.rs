@@ -15,6 +15,7 @@ pub const T_UINT8: u32 = 0x0077;
 pub const T_UQUAD: u32 = 0x0023;
 
 // Leaf kinds.
+const LF_MODIFIER: u16 = 0x1001;
 const LF_POINTER: u16 = 0x1002;
 const LF_PROCEDURE: u16 = 0x1008;
 const LF_ARGLIST: u16 = 0x1201;
@@ -58,6 +59,13 @@ pub struct TypeRec {
 fn finish(kind: u16, mut body: Vec<u8>, name: Option<String>, fwdref: bool) -> TypeRec {
     pad_type(&mut body);
     TypeRec { bytes: frame(kind, &body), kind, name, fwdref }
+}
+
+pub fn modifier(ty: u32, flags: u16) -> TypeRec {
+    let mut b = W::new();
+    b.u32(ty);
+    b.u16(flags);
+    finish(LF_MODIFIER, b.buf, None, false)
 }
 
 pub fn ptr64(referent: u32) -> TypeRec {
