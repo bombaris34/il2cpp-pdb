@@ -1,9 +1,11 @@
 // il2cpp_pdbgen — native PDB writer for Il2CppDumper output.
 #![allow(dead_code, unused_variables)]
 mod cv;
+mod dwarf;
 mod gsi;
 mod il2cpp;
 mod msf;
+mod macho;
 mod pe;
 mod streams;
 mod tpi;
@@ -31,21 +33,30 @@ struct Script {
 
 fn usage() -> ! {
     eprintln!(
-        "il2cpp_pdbgen — generate a PDB from Il2CppDumper output (x64 PE only)\n\
+        "il2cpp_pdbgen — generate PDB (PE) or dSYM (Mach-O) symbols\n\
          \n\
          usage:\n\
-         \x20 il2cpp_pdbgen <dir>                       outputs <dir>\\<dll-name>.pdb\n\
-         \x20 il2cpp_pdbgen <dll> <il2cpp.h> <script.json> [out.pdb]\n\
+         \x20 il2cpp_pdbgen <dir>\n\
+         \x20 il2cpp_pdbgen <binary> <il2cpp.h> <script.json> [output] [--slice <index>]\n\
          \n\
-         <dir> mode expects GameAssembly.dll, il2cpp.h and script.json in that directory."
+         For universal Mach-O binaries, --slice is a zero-based architecture index.\n\
+         Directory mode expects GameAssembly.dll, il2cpp.h and script.json."
     );
     std::process::exit(2);
 }
 
 fn main() {
     let t0 = std::time::Instant::now();
-    let a: Vec<String> = std::env::args().collect();
-    let (dll, header_path, json_path, out_path) = match a.len() {
+    let mut a: Vec<String> = std::env::args().collect();
+    let slice = if let Some(i) = a.iter().position(|x| x == "--slice") {
+        if i + 2 != a.len() { usage(); }
+        let index = a[i + 1].parse::<usize>().unwrap_or_else(|_| usage());
+        a.truncate(i);
+        Some(index)
+    } else {
+        None
+    };
+    let (dll, header_path, json_path, explicit_out) = match a.len() {
         // single directory containing the standard Il2CppDumper outputs + the DLL
         2 => {
             let d = std::path::Path::new(&a[1]);
@@ -55,22 +66,37 @@ fn main() {
                 dll.to_string_lossy().into_owned(),
                 d.join("il2cpp.h").to_string_lossy().into_owned(),
                 d.join("script.json").to_string_lossy().into_owned(),
-                d.join(format!("{stem}.pdb")).to_string_lossy().into_owned(),
+                Some(d.join(format!("{stem}.pdb")).to_string_lossy().into_owned()),
             )
         }
         4 | 5 => {
             let dll = a[1].clone();
-            let out = if a.len() == 5 {
-                a[4].clone()
-            } else {
-                let p = std::path::Path::new(&dll);
-                let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("GameAssembly");
-                p.with_file_name(format!("{stem}.pdb")).to_string_lossy().into_owned()
-            };
+            let out = if a.len() == 5 { Some(a[4].clone()) } else { None };
             (dll, a[2].clone(), a[3].clone(), out)
         }
         _ => usage(),
     };
+
+    use std::io::Read;
+    let mut magic = [0u8; 4];
+    std::fs::File::open(&dll).expect("open binary").read_exact(&mut magic).expect("read binary magic");
+    let is_pe = &magic[..2] == b"MZ";
+    let out_path = explicit_out.unwrap_or_else(|| {
+        let p = std::path::Path::new(&dll);
+        if is_pe {
+            p.with_extension("pdb").to_string_lossy().into_owned()
+        } else {
+            format!("{}.dSYM", p.display())
+        }
+    });
+    if !is_pe {
+        generate_macho(&dll, &header_path, &json_path, &out_path, slice, t0);
+        return;
+    }
+    if slice.is_some() {
+        eprintln!("--slice is only valid for Mach-O binaries");
+        std::process::exit(2);
+    }
 
     // 1. PE: sections + auto-match GUID/age.
     let pe = pe::parse(&dll);
@@ -78,7 +104,7 @@ fn main() {
 
     // 2. Types from il2cpp.h.
     let header = std::fs::read_to_string(&header_path).expect("read il2cpp.h");
-    let mut types = il2cpp::parse_and_build(&header);
+    let mut types = il2cpp::parse_and_build(&header, false);
     eprintln!("types: {} records in {:?}", types.records.len(), t0.elapsed());
 
     // 3. script.json.
@@ -131,4 +157,35 @@ fn main() {
     });
     std::fs::write(&out_path, &pdb).expect("write pdb");
     eprintln!("wrote {} ({} MB) in {:?}", out_path, pdb.len() / 1_000_000, t0.elapsed());
+}
+
+fn generate_macho(binary: &str, header_path: &str, json_path: &str, output: &str, slice: Option<usize>, start: std::time::Instant) {
+    let macho = macho::parse(binary, slice).unwrap_or_else(|e| { eprintln!("Mach-O: {e}"); std::process::exit(1) });
+    let header = std::fs::read_to_string(header_path).expect("read il2cpp.h");
+    let mut types = il2cpp::parse_and_build(&header, true);
+    let input = std::io::BufReader::new(std::fs::File::open(json_path).expect("open script.json"));
+    let script: Script = serde_json::from_reader(input).expect("parse script.json");
+    let mut addresses = script.addresses;
+    addresses.sort_unstable();
+    addresses.dedup();
+    let mut functions = Vec::with_capacity(script.script_method.len());
+    for method in script.script_method {
+        let Some(address) = macho.base.checked_add(method.address) else { continue };
+        let Some((_, section_end)) = macho.executable_sections.iter()
+            .find(|&&(begin, end)| address >= begin && address < end) else { continue };
+        let next = addresses.partition_point(|&a| a <= method.address);
+        let end = addresses.get(next).and_then(|a| macho.base.checked_add(*a))
+            .unwrap_or(*section_end).min(*section_end);
+        let size = end.saturating_sub(address).min(0x20_0000);
+        let type_index = method.signature.as_deref().filter(|s| !s.is_empty())
+            .map(|s| types.sig_to_proc(s)).unwrap_or(0);
+        functions.push(dwarf::Function { name: method.name, address, size, type_index });
+    }
+    eprintln!("Mach-O: {} functions, {} type records", functions.len(), types.records.len());
+    let sections = dwarf::generate(&types.records, &functions)
+        .unwrap_or_else(|e| { eprintln!("DWARF: {e}"); std::process::exit(1) });
+    let name = std::path::Path::new(binary).file_name().and_then(|n| n.to_str()).expect("binary name");
+    macho.write_dsym(output, name, sections)
+        .unwrap_or_else(|e| { eprintln!("dSYM: {e}"); std::process::exit(1) });
+    eprintln!("wrote {output} in {:?}", start.elapsed());
 }
